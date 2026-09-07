@@ -4,6 +4,11 @@
  * Simulated escrow / payment operations backed by localStorage.
  * No real payment processing — this is a hackathon MVP.
  *
+ * Escrow always operates against the LOCKED AGREEMENT: createPayment() reads
+ * project.budget, which the projects service keeps in sync with the current
+ * mutually agreed version. A pending escrow is re-valued when a change
+ * proposal is accepted; a locked escrow is deliberately left untouched.
+ *
  * Storage key: tf_payments
  */
 
@@ -150,6 +155,48 @@ export function lockPayment(
 }
 
 /**
+ * Re-value a not-yet-locked escrow payment after the agreement changed.
+ *
+ * Called after a change proposal is accepted, so the amount the client is about
+ * to lock matches the newly agreed version.
+ *
+ * If funds are already locked (or released) the held amount is NOT rewritten:
+ * moving money that is already in escrow would need a real re-authorisation
+ * step from the payer, which is outside this MVP. The caller receives
+ * "locked" so the UI can tell the parties the escrow still reflects the
+ * earlier version.
+ */
+export function syncPendingPaymentToAgreement(
+    projectId: string,
+): "updated" | "locked" | "none" {
+    const project = getProjectById(projectId);
+    if (!project) return "none";
+
+    const payments = getStoredPayments();
+    const idx = payments.findIndex((p) => p.projectId === projectId);
+    if (idx === -1) return "none";
+
+    const current = payments[idx];
+    if (current.status !== "pending") return "locked";
+
+    if (
+        current.amount === project.budget &&
+        current.currency === project.currency
+    ) {
+        return "updated";
+    }
+
+    payments[idx] = {
+        ...current,
+        amount: project.budget,
+        currency: project.currency,
+    };
+    saveStoredPayments(payments);
+
+    return "updated";
+}
+
+/**
  * Release a LOCKED payment and complete the project.
  *
  * Validates:
@@ -197,6 +244,15 @@ export function releasePayment(
         );
     }
 
+    if (
+        current.amount !== project.budget ||
+        current.currency !== project.currency
+    ) {
+        throw new Error(
+            `Cannot release payment: locked escrow (${current.currency} ${current.amount.toLocaleString()}) does not match current agreement (${project.currency} ${project.budget.toLocaleString()}). The escrow must match the current agreement before releasing payment.`,
+        );
+    }
+
     // Update payment: LOCKED → RELEASED
     payments[idx] = {
         ...current,
@@ -209,6 +265,53 @@ export function releasePayment(
     transitionProject(projectId, "PAYMENT_RELEASED");
     transitionProject(projectId, "FINAL_DELIVERY_RELEASED");
     transitionProject(projectId, "COMPLETED");
+
+    return toPayment(payments[idx]);
+}
+
+/**
+ * Check if the locked escrow payment amount or currency differs from the project's current agreed budget.
+ */
+export function hasEscrowMismatch(projectId: string): boolean {
+    const project = getProjectById(projectId);
+    if (!project) return false;
+    const payment = getPaymentByProjectId(projectId);
+    if (!payment || payment.status !== "locked") return false;
+    return (
+        payment.amount !== project.budget || payment.currency !== project.currency
+    );
+}
+
+/**
+ * Explicitly update the locked escrow amount to match the current agreement version.
+ * Only the project client can perform this action. Never happens automatically.
+ */
+export function relockPaymentToAgreement(
+    projectId: string,
+    clientId: string,
+): Payment {
+    const project = getProjectById(projectId);
+    if (!project) throw new Error("Project not found.");
+    if (project.clientId !== clientId) {
+        throw new Error("Only the project client can adjust escrow.");
+    }
+
+    const payments = getStoredPayments();
+    const idx = payments.findIndex((p) => p.projectId === projectId);
+    if (idx === -1) throw new Error("No payment found for this project.");
+
+    const current = payments[idx];
+    if (current.status !== "locked") {
+        throw new Error(`Cannot adjust escrow in status "${current.status}".`);
+    }
+
+    payments[idx] = {
+        ...current,
+        amount: project.budget,
+        currency: project.currency,
+        lockedAt: new Date().toISOString(),
+    };
+    saveStoredPayments(payments);
 
     return toPayment(payments[idx]);
 }

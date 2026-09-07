@@ -42,6 +42,9 @@ export function PaymentStatus({
 
   const isLocked = payment.status === "locked";
   const isReleased = payment.status === "released";
+  const hasMismatch =
+    isLocked &&
+    (payment.amount !== projectBudget || payment.currency !== projectCurrency);
 
   const variant =
     isReleased
@@ -93,6 +96,19 @@ export function PaymentStatus({
             <p className="mt-1 text-xs text-zinc-400">
               Locked on {payment.lockedAt.toLocaleDateString()}
             </p>
+          )}
+
+          {hasMismatch && (
+            <div className="mt-3 rounded-md border border-amber-300 bg-amber-50 p-2.5 text-xs text-amber-800">
+              <p className="font-semibold">⚠️ Escrow Mismatch with Current Agreement</p>
+              <p className="mt-1">
+                Escrow holds: <strong>{payment.currency} {payment.amount.toLocaleString()}</strong><br />
+                Current agreement in force: <strong>{projectCurrency} {projectBudget.toLocaleString()}</strong>
+              </p>
+              <p className="mt-1 text-amber-700">
+                The agreement was amended after funds were locked. Escrow must match the current agreement before payment can be released.
+              </p>
+            </div>
           )}
         </div>
       )}

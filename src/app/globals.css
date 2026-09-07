@@ -1,26 +1,176 @@
 @import "tailwindcss";
 
+/*
+ * ─── Theme ────────────────────────────────────────────────────────────────
+ *
+ * One always-on dark theme. It deliberately does NOT follow the OS.
+ *
+ * Why this file is the fix: every page and shared component is authored with
+ * light-only utilities (`bg-white` cards, `border-zinc-200`, `text-zinc-*`),
+ * but the old stylesheet flipped `body` to near-black with light text under
+ * `prefers-color-scheme: dark`. On a dark-OS machine that produced:
+ *
+ *   - light text on white cards for any element with no explicit text colour
+ *     (Modal headings, Card copy) — invisible
+ *   - light text on the browser's default light field for every form control
+ *     — nothing in the app sets a background on an input/textarea/select
+ *   - native <select> popups and <option> rows rendered in light OS chrome
+ *   - hairline light borders glaring on a near-black page
+ *
+ * Everything below is global: re-theming the zinc ramp plus element-level
+ * defaults. No page markup is patched.
+ */
+
+/* `dark:` is class-based and permanently enabled from <html class="dark">,
+   so the theme cannot drift with the visitor's OS preference. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ─── Design tokens ─────────────────────────────────────────────────────── */
+
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  /* Tells the browser to render native UI — select dropdown popups, option
+     rows, the date picker, scrollbars, checkboxes — in dark chrome. This is
+     the only way to theme a native <select> popup. */
+  color-scheme: dark;
+
+  --background: #0b0b0d;
+  /* page */
+  --foreground: #e6e6ea;
+  /* default text */
+
+  --surface: #18181b;
+  /* cards, modals */
+  --field: #101014;
+  /* inputs, textareas, selects */
+
+  --text-on-light: #18181b;
+  /* forced text on surfaces that stay light */
 }
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
+  --color-surface: var(--surface);
+  --color-field: var(--field);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+/*
+ * ─── Re-mapped zinc ramp ──────────────────────────────────────────────────
+ *
+ * Safe to re-map because in this codebase each shade has exactly one job:
+ *
+ *   zinc-50 / zinc-100   → surfaces and chips only, never text
+ *   zinc-200 / zinc-300  → borders only, never text
+ *   zinc-400 … zinc-700  → text only, never a surface or border
+ *
+ * So redefining the tokens re-themes all ~230 zinc usages across every page
+ * at once — including `hover:`, `focus:` and `dark:` variants — with no
+ * `!important`, no specificity fight, and no markup edits.
+ *
+ * The text ramp is inverted on purpose: zinc-700 was the *strongest* text on
+ * white, so it becomes the *brightest* text on dark.
+ *
+ * zinc-800 / 900 / 950 are left untouched — they are already dark surfaces.
+ */
+@theme {
+  --color-zinc-50: #1c1c21;
+  /* sidebar, subtle hover lift */
+  --color-zinc-100: #26262c;
+  /* chips, badges, avatar circles */
+  --color-zinc-200: #2f2f36;
+  /* hairline borders */
+  --color-zinc-300: #3d3d46;
+  /* form control borders */
+  --color-zinc-400: #9898a2;
+  /* faintest text */
+  --color-zinc-500: #b3b3bc;
+  /* muted text */
+  --color-zinc-600: #d5d5dc;
+  /* body text */
+  --color-zinc-700: #ededf1;
+  /* strongest text, labels */
+}
+
+/* ─── Base ──────────────────────────────────────────────────────────────── */
+
+@layer base {
+  body {
+    background: var(--background);
+    color: var(--foreground);
+    font-family: Arial, Helvetica, sans-serif;
+  }
+
+  /* `focus:ring-offset-2` defaults to a white offset ring, which reads as a
+     glaring halo around focused buttons on a dark page. Registered as a
+     non-inheriting custom property, so it has to be set per element. */
+  :where(*) {
+    --tw-ring-offset-color: var(--background);
+  }
+
+  /*
+   * Form controls: dark field, light text, visible border.
+   *
+   * :where() keeps specificity at zero, so an explicit utility on a control
+   * still wins — it just so happens that none of them set a background.
+   */
+  :where(input, textarea, select) {
+    background-color: var(--field);
+    border-color: var(--color-zinc-300);
+    color: var(--foreground);
+  }
+
+  :where(input)::placeholder,
+  :where(textarea)::placeholder {
+    color: var(--color-zinc-400);
+    opacity: 1;
+  }
+
+  /* <option> rows. Chrome and Edge derive the closed select and its popup
+     from `color-scheme`; Firefox and Safari honour these colours instead. */
+  :where(option) {
+    background-color: var(--field);
+    color: var(--foreground);
   }
 }
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+/*
+ * ─── Surfaces that stay intentionally light ───────────────────────────────
+ *
+ * The status/alert panels (`bg-red-50`, `bg-green-50`, `bg-amber-50`, …) and
+ * the `bg-white` utility are light by design and pair with dark semantic text
+ * such as `text-red-600`. Their family colours are NOT re-mapped — `bg-blue-600`
+ * is the primary button, so touching the 600/700 shades would break buttons.
+ *
+ * Instead, inside these surfaces the zinc ramp is restored to its original
+ * light-theme values. Because the utilities resolve through
+ * `var(--color-zinc-N)`, redefining the variable for the subtree makes every
+ * `text-zinc-*` / `border-zinc-*` inside a light panel dark again — with no
+ * specificity conflict at all.
+ *
+ * Placed in `@layer components` so any `text-*` utility on the element itself
+ * (e.g. `text-green-700` on a badge) still wins over the forced `color`.
+ */
+@layer components {
+
+  :is(.bg-white,
+    .bg-red-50,
+    .bg-red-100,
+    .bg-green-50,
+    .bg-green-100,
+    .bg-amber-50,
+    .bg-amber-100,
+    .bg-blue-50,
+    .bg-blue-100,
+    .bg-yellow-100) {
+    --color-zinc-200: #e4e4e7;
+    --color-zinc-300: #d4d4d8;
+    --color-zinc-400: #71717a;
+    --color-zinc-500: #52525b;
+    --color-zinc-600: #3f3f46;
+    --color-zinc-700: #27272a;
+
+    color: var(--text-on-light);
+  }
 }

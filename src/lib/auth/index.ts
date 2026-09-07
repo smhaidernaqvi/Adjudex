@@ -280,3 +280,48 @@ export function getUserById(id: string): User | null {
     const { passwordHash: _, salt: __, ...user } = stored;
     return user;
 }
+
+// ─── Counterparty directory ──────────────────────────────────
+//
+// Adjudex has no public marketplace and no search ranking. A transaction is
+// always addressed to ONE specific account. These lookups exist purely so the
+// initiator can pick the person they already found elsewhere.
+//
+// Password hashes and salts are never returned.
+
+/**
+ * List registered accounts, optionally filtered by role and excluding one id.
+ * Used by the "select counterparty" picker in the create-transaction flow.
+ */
+export function listUsers(options?: {
+    role?: UserRole;
+    excludeUserId?: string;
+}): User[] {
+    return getStoredUsers()
+        .filter((u) => {
+            if (options?.role && u.role !== options.role) return false;
+            if (options?.excludeUserId && u.id === options.excludeUserId) {
+                return false;
+            }
+            return true;
+        })
+        .map(({ passwordHash: _, salt: __, ...user }) => user)
+        .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/**
+ * Look up an account by email (case-insensitive).
+ * Lets the initiator invite someone whose Adjudex email they already know.
+ */
+export function findUserByEmail(email: string): User | null {
+    const needle = email.trim().toLowerCase();
+    if (!needle) return null;
+
+    const stored = getStoredUsers().find(
+        (u) => u.email.toLowerCase() === needle,
+    );
+    if (!stored) return null;
+
+    const { passwordHash: _, salt: __, ...user } = stored;
+    return user;
+}

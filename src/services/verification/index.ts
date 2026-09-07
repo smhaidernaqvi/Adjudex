@@ -6,25 +6,31 @@
  *
  * Flow:
  *   SUBMITTED project
- *     → load requirements + submission
- *     → call AI service
- *     → store verification result
+ *     → load the CURRENT MUTUALLY AGREED requirement version + submission
+ *     → call the server-side AI route
+ *     → store the verification result, stamped with the version it checked
  *     → transition project SUBMITTED → AI_VERIFICATION → CLIENT_REVIEW
  *
- * Feature 7 (Client Review / Approval) will read the verification from
- * getVerificationByProjectId() and act on it.
+ * Privacy: verification results are private to the two parties. Every entry
+ * point takes the acting user id and refuses non-participants.
+ *
+ * Correctness: verification NEVER runs against the original rough requirements,
+ * an unaccepted change proposal, or a one-sided edit — it reads the latest
+ * AgreementVersion, which by construction only exists once both parties
+ * accepted that exact set of terms.
  */
 
 import type { AIVerificationResult } from "@/types";
+import { isProjectParticipant } from "@/lib/authz";
 import {
     getProjectById,
     getRequirementsByProjectId,
     transitionProject,
 } from "@/services/projects";
+import { getCurrentAgreementVersion } from "@/services/agreements";
 import { getSubmissionByProjectId } from "@/services/submissions";
 import {
     verifyDeliverableWithAI,
-    isAIConfigured,
 } from "@/lib/ai";
 import type { AIVerificationInput } from "@/lib/ai";
 
@@ -48,6 +54,8 @@ interface StoredVerification {
         confidence: number;
     }[];
     status: "pending" | "completed" | "failed";
+    agreementVersionId: string | null;
+    agreementVersion: number | null;
     createdAt: string;
 }
 
@@ -87,7 +95,9 @@ function saveStoredVerifications(vers: StoredVerification[]): void {
 
 /**
  * Get the latest completed verification for a project.
- * Returns null if no verification exists.
+ *
+ * RAW READ — no authorization. Services use it internally; UI code must call
+ * getVerificationForUser().
  */
 export function getVerificationByProjectId(
     projectId: string,
@@ -104,36 +114,68 @@ export function getVerificationByProjectId(
 }
 
 /**
- * Check if AI verification is available (API key configured).
+ * Authorized read: the verification report, but only for a party to the
+ * transaction. Returns null for anyone else.
  */
-export function isVerificationAvailable(): boolean {
-    return isAIConfigured();
+export function getVerificationForUser(
+    projectId: string,
+    userId: string | null | undefined,
+): AIVerificationResult | null {
+    const project = getProjectById(projectId);
+    if (!project || !isProjectParticipant(project, userId)) return null;
+    return getVerificationByProjectId(projectId);
+}
+
+/**
+ * The latest verification record of ANY status (used to surface failures).
+ * Authorized — participants only.
+ */
+export function getLatestVerificationRecordForUser(
+    projectId: string,
+    userId: string | null | undefined,
+): AIVerificationResult | null {
+    const project = getProjectById(projectId);
+    if (!project || !isProjectParticipant(project, userId)) return null;
+
+    const all = getStoredVerifications()
+        .filter((v) => v.projectId === projectId)
+        .sort(
+            (a, b) =>
+                new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
+        );
+    return all.length > 0 ? toVerification(all[0]) : null;
 }
 
 /**
  * Run AI verification on a submitted deliverable.
  *
  * Validates:
+ * - The caller is one of the two parties to this transaction
  * - Project exists and is in SUBMITTED state
+ * - A mutually agreed, locked requirement version exists
  * - Submission exists and belongs to the project
- * - No completed verification already exists (unless re-verification is needed)
- * - AI API key is configured
+ * - No completed verification already exists
  *
  * On success:
- * - Calls AI service
- * - Stores verification result
+ * - Calls the server-side AI route with the AGREED requirements
+ * - Stores the verification result, stamped with the agreement version
  * - Transitions project: SUBMITTED → AI_VERIFICATION → CLIENT_REVIEW
  *
  * On failure:
- * - Stores a "failed" verification record
+ * - Stores a "failed" verification record so the user can retry
  * - Throws with descriptive error
  */
 export async function runVerification(
     projectId: string,
+    actingUserId: string,
 ): Promise<AIVerificationResult> {
-    // ── Validate project ────────────────────────────────────
+    // ── Validate project + authorization ────────────────────
     const project = getProjectById(projectId);
-    if (!project) throw new Error("Project not found.");
+    if (!project) throw new Error("Transaction not found.");
+
+    if (!isProjectParticipant(project, actingUserId)) {
+        throw new Error("You do not have access to this transaction.");
+    }
 
     if (project.status !== "SUBMITTED") {
         throw new Error(
@@ -155,14 +197,14 @@ export async function runVerification(
         );
     }
 
-    // ── Check AI availability ───────────────────────────────
-    if (!isAIConfigured()) {
+    // ── Load the LOCKED, mutually agreed requirements ───────
+    // Never the rough input, never a pending change proposal.
+    const agreedVersion = getCurrentAgreementVersion(projectId);
+    if (!agreedVersion) {
         throw new Error(
-            "AI verification is not configured. Add NEXT_PUBLIC_AI_API_KEY to your .env.local file.",
+            "No mutually agreed requirement version exists for this transaction, so there is nothing objective to verify against.",
         );
     }
-
-    // ── Load requirements ───────────────────────────────────
     const requirements = getRequirementsByProjectId(projectId);
 
     // ── Build AI input ──────────────────────────────────────
@@ -183,6 +225,8 @@ export async function runVerification(
         summary: "",
         requirementResults: [],
         status: "pending",
+        agreementVersionId: agreedVersion.id,
+        agreementVersion: agreedVersion.version,
         createdAt: new Date(),
     };
 
@@ -203,6 +247,8 @@ export async function runVerification(
             summary: aiOutput.summary,
             requirementResults: aiOutput.requirementResults,
             status: "completed",
+            agreementVersionId: agreedVersion.id,
+            agreementVersion: agreedVersion.version,
             createdAt: new Date(),
         };
 
@@ -234,6 +280,8 @@ export async function runVerification(
                     : "Verification failed due to an unknown error.",
             requirementResults: [],
             status: "failed",
+            agreementVersionId: agreedVersion.id,
+            agreementVersion: agreedVersion.version,
             createdAt: new Date(),
         };
 
@@ -251,8 +299,15 @@ export async function runVerification(
 /**
  * Remove a failed verification record to allow retry.
  * Only removes failed records — completed verifications are kept.
+ * Participants only.
  */
-export function clearFailedVerification(projectId: string): void {
+export function clearFailedVerification(
+    projectId: string,
+    actingUserId: string,
+): void {
+    const project = getProjectById(projectId);
+    if (!project || !isProjectParticipant(project, actingUserId)) return;
+
     const stored = getStoredVerifications();
     const filtered = stored.filter(
         (v) => !(v.projectId === projectId && v.status === "failed"),

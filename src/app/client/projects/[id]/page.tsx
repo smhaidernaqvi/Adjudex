@@ -1,10 +1,20 @@
 "use client";
 
 /**
- * Client Project Details
+ * Client Project Details — the execution view of a locked agreement.
  *
  * Displays full project information: title, description, budget,
- * deadline, requirements checklist, status, and escrow payment section.
+ * deadline, the AGREED requirement set, status, and the escrow payment section.
+ *
+ * Privacy: the record is resolved through getProjectForUser(), so a user who is
+ * not one of the two participants gets null and sees the same "not found"
+ * screen as an invalid id. Every mutation below passes the acting user id so
+ * the service layer can re-check participation.
+ *
+ * Requirements come from the current mutually agreed version — never from a
+ * raw list, an unaccepted change proposal, or a one-sided edit. AI verification
+ * therefore always evaluates the delivery against what both parties actually
+ * agreed to.
  */
 
 import { useEffect, useState, Suspense, useCallback } from "react";
@@ -16,23 +26,24 @@ import { StatusBadge } from "@/components/ui/StatusBadge";
 import { Modal } from "@/components/ui/Modal";
 import { PaymentStatus } from "@/components/payment/PaymentStatus";
 import {
-    getProjectById,
+    getProjectForUser,
     getRequirementsByProjectId,
 } from "@/services/projects";
 import {
     getPaymentByProjectId,
     createPayment,
     lockPayment,
+    relockPaymentToAgreement,
     releasePayment,
 } from "@/services/payments";
 import { getUserById } from "@/lib/auth";
 import { getSubmissionByProjectId } from "@/services/submissions";
 import {
-    getVerificationByProjectId,
+    getVerificationForUser,
     runVerification,
-    isVerificationAvailable,
     clearFailedVerification,
 } from "@/services/verification";
+import { getTransactionByProjectId } from "@/services/transactions";
 import { VerificationReport } from "@/components/verification/VerificationReport";
 import { approveDeliverable, getApprovalByProjectId } from "@/services/approval";
 import {
@@ -68,6 +79,7 @@ function ProjectDetails({ params }: { params: { id: string } }) {
     const justCreated = searchParams.get("created") === "1";
 
     const [project, setProject] = useState<Project | null>(null);
+    const [transactionId, setTransactionId] = useState<string | null>(null);
     const [requirements, setRequirements] = useState<Requirement[]>([]);
     const [freelancerUser, setFreelancerUser] = useState<User | null>(null);
     const [payment, setPayment] = useState<Payment | null>(null);
@@ -83,7 +95,6 @@ function ProjectDetails({ params }: { params: { id: string } }) {
     // ── Verification state ────────────────────────────────────
     const [verifying, setVerifying] = useState(false);
     const [verifyError, setVerifyError] = useState("");
-    const aiConfigured = isVerificationAvailable();
 
     // ── Review state ──────────────────────────────────────────
     const [showApproveModal, setShowApproveModal] = useState(false);
@@ -102,22 +113,36 @@ function ProjectDetails({ params }: { params: { id: string } }) {
     const [releaseError, setReleaseError] = useState("");
     const [releaseSuccess, setReleaseSuccess] = useState(false);
 
-    // Load data
+    // ── Escrow relock state (when agreement was amended after lock) ──
+    const [showRelockModal, setShowRelockModal] = useState(false);
+    const [relocking, setRelocking] = useState(false);
+    const [relockError, setRelockError] = useState("");
+    const [relockSuccess, setRelockSuccess] = useState(false);
+
+    // Load data — every read is participant-scoped.
     const loadData = useCallback(() => {
-        const p = getProjectById(params.id);
-        if (p) {
-            setProject(p);
-            setRequirements(getRequirementsByProjectId(p.id));
-            if (p.freelancerId) {
-                setFreelancerUser(getUserById(p.freelancerId));
-            }
-            setPayment(getPaymentByProjectId(p.id));
-            setSubmission(getSubmissionByProjectId(p.id));
-            setVerification(getVerificationByProjectId(p.id));
-            setApproval(getApprovalByProjectId(p.id));
-            setDispute(getAnyDisputeByProjectId(p.id));
+        if (!user) return;
+
+        const p = getProjectForUser(params.id, user.id);
+        if (!p) {
+            // Either it does not exist or this user is not a party to it.
+            setProject(null);
+            return;
         }
-    }, [params.id]);
+
+        setProject(p);
+        setTransactionId(getTransactionByProjectId(p.id)?.id ?? null);
+        // Returns the requirement set of the current agreed version.
+        setRequirements(getRequirementsByProjectId(p.id));
+        if (p.freelancerId) {
+            setFreelancerUser(getUserById(p.freelancerId));
+        }
+        setPayment(getPaymentByProjectId(p.id));
+        setSubmission(getSubmissionByProjectId(p.id));
+        setVerification(getVerificationForUser(p.id, user.id));
+        setApproval(getApprovalByProjectId(p.id));
+        setDispute(getAnyDisputeByProjectId(p.id));
+    }, [params.id, user]);
 
     useEffect(() => {
         loadData();
@@ -146,6 +171,26 @@ function ProjectDetails({ params }: { params: { id: string } }) {
         }
     }
 
+    // Relock / update escrow handler
+    function handleRelockPayment() {
+        if (!user || !project) return;
+        setRelocking(true);
+        setRelockError("");
+
+        try {
+            relockPaymentToAgreement(project.id, user.id);
+            setRelockSuccess(true);
+            setShowRelockModal(false);
+            loadData();
+        } catch (err) {
+            setRelockError(
+                err instanceof Error ? err.message : "Failed to update escrow.",
+            );
+        } finally {
+            setRelocking(false);
+        }
+    }
+
     // ── Derived state ─────────────────────────────────────────
 
     const freelancerAccepted = project?.status === "FREELANCER_ACCEPTED";
@@ -154,6 +199,11 @@ function ProjectDetails({ params }: { params: { id: string } }) {
         (!payment || payment.status === "pending") &&
         user?.role === "client";
     const isPaymentLocked = payment?.status === "locked";
+
+    const hasEscrowMismatch =
+        payment?.status === "locked" &&
+        project !== null &&
+        (payment.amount !== project.budget || payment.currency !== project.currency);
 
     // Verification readiness: project is SUBMITTED, submission exists, no verification yet
     const canVerify =
@@ -168,21 +218,24 @@ function ProjectDetails({ params }: { params: { id: string } }) {
     const isDisputed = project?.status === "DISPUTED";
     const isCompleted = project?.status === "COMPLETED";
 
-    // Can release: project approved + payment locked + user is client
+    // Can release: project approved + payment locked + no escrow mismatch + user is client
     const canReleasePayment =
         isApproved &&
         payment?.status === "locked" &&
+        !hasEscrowMismatch &&
         user?.role === "client";
 
     // Handle AI verification
     async function handleVerify() {
-        if (!project) return;
+        if (!project || !user) return;
         setVerifying(true);
         setVerifyError("");
 
         try {
-            clearFailedVerification(project.id);
-            const result = await runVerification(project.id);
+            // Both calls re-check participation in the service layer and run
+            // against the current mutually agreed version.
+            clearFailedVerification(project.id, user.id);
+            const result = await runVerification(project.id, user.id);
             setVerification(result);
             loadData();
         } catch (err) {
@@ -265,16 +318,28 @@ function ProjectDetails({ params }: { params: { id: string } }) {
         }
     }
 
-    // ── Not found ─────────────────────────────────────────────
+    // ── Not found / not a participant ─────────────────────────
+
+    if (!user) {
+        return (
+            <main className="flex flex-1 items-center justify-center">
+                <p className="text-sm text-zinc-500">Loading…</p>
+            </main>
+        );
+    }
 
     if (!project) {
         return (
             <main className="flex flex-1 items-center justify-center">
                 <div className="text-center">
-                    <h2 className="text-lg font-semibold">Project not found</h2>
+                    <h2 className="text-lg font-semibold">Transaction not found</h2>
+                    <p className="mx-auto mt-2 max-w-sm text-sm text-zinc-500">
+                        Adjudex transactions are private. Either this id does not
+                        exist, or you are not one of its two participants.
+                    </p>
                     <Link
                         href="/client/dashboard"
-                        className="mt-2 text-sm text-blue-600 hover:underline"
+                        className="mt-3 inline-block text-sm text-blue-600 hover:underline"
                     >
                         Back to dashboard
                     </Link>
@@ -293,6 +358,11 @@ function ProjectDetails({ params }: { params: { id: string } }) {
             {lockSuccess && (
                 <div className="mb-4 rounded-md bg-green-50 px-4 py-3 text-sm text-green-700">
                     &#128274; Payment locked successfully! The funds are now held in escrow.
+                </div>
+            )}
+            {relockSuccess && (
+                <div className="mb-4 rounded-md bg-green-50 px-4 py-3 text-sm text-green-700">
+                    &#128274; Escrow amount updated successfully to match the current agreement!
                 </div>
             )}
             {approveSuccess && (
@@ -324,6 +394,14 @@ function ProjectDetails({ params }: { params: { id: string } }) {
                     <h1 className="mt-2 text-2xl font-bold tracking-tight">
                         {project.title}
                     </h1>
+                    {transactionId && (
+                        <Link
+                            href={`/transactions/${transactionId}`}
+                            className="mt-1 inline-block text-xs text-blue-600 hover:underline"
+                        >
+                            Agreement, version history &amp; change proposals →
+                        </Link>
+                    )}
                 </div>
                 <StatusBadge status={project.status} />
             </div>
@@ -416,6 +494,16 @@ function ProjectDetails({ params }: { params: { id: string } }) {
                             projectBudget={project.budget}
                             projectCurrency={project.currency}
                         />
+                        {hasEscrowMismatch && (
+                            <div className="mt-3">
+                                <button
+                                    onClick={() => setShowRelockModal(true)}
+                                    className="rounded-md bg-blue-600 px-4 py-2 text-xs font-medium text-white transition-colors hover:bg-blue-700"
+                                >
+                                    Update Escrow to {project.currency} {project.budget.toLocaleString()}
+                                </button>
+                            </div>
+                        )}
                     </div>
                 )}
 
@@ -537,25 +625,13 @@ function ProjectDetails({ params }: { params: { id: string } }) {
                             <p className="text-sm text-zinc-600">
                                 Deliverable submitted. Ready for AI verification.
                             </p>
-                            {aiConfigured ? (
-                                <button
-                                    onClick={handleVerify}
-                                    className="mt-3 rounded-md bg-blue-600 px-5 py-2.5 text-sm font-medium text-white transition-colors hover:bg-blue-700"
-                                >
-                                    Run AI Verification
-                                </button>
-                            ) : (
-                                <div className="mt-3 rounded-md border border-amber-200 bg-amber-50 px-4 py-3">
-                                    <p className="text-sm text-amber-700">
-                                        AI verification is not configured yet.
-                                    </p>
-                                    <p className="mt-1 text-xs text-amber-600">
-                                        Add <code className="rounded bg-amber-100 px-1">NEXT_PUBLIC_AI_API_KEY</code>{" "}
-                                        to your <code className="rounded bg-amber-100 px-1">.env.local</code> file to enable
-                                        AI-powered deliverable verification.
-                                    </p>
-                                </div>
-                            )}
+                            <button
+                                onClick={handleVerify}
+                                disabled={verifying}
+                                className="mt-3 rounded-md bg-blue-600 px-5 py-2.5 text-sm font-medium text-white transition-colors hover:bg-blue-700 disabled:opacity-50"
+                            >
+                                Run AI Verification
+                            </button>
                         </div>
                     )}
 
@@ -618,6 +694,23 @@ function ProjectDetails({ params }: { params: { id: string } }) {
                         <p className="mt-2 text-xs text-zinc-400">
                             Approved {approval.approvedAt.toLocaleString()}
                         </p>
+                    )}
+                    {hasEscrowMismatch && (
+                        <div className="mt-3 rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-800">
+                            <p className="font-semibold">⚠️ Payment Release Blocked: Escrow Mismatch</p>
+                            <p className="mt-1">
+                                The current agreement in force is for <strong>{project.currency} {project.budget.toLocaleString()}</strong>, but <strong>{payment?.currency} {payment?.amount.toLocaleString()}</strong> is currently held in escrow.
+                            </p>
+                            <p className="mt-1">
+                                Escrow must match the current agreement before payment can be released.
+                            </p>
+                            <button
+                                onClick={() => setShowRelockModal(true)}
+                                className="mt-3 rounded-md bg-blue-600 px-4 py-2 text-xs font-medium text-white transition-colors hover:bg-blue-700"
+                            >
+                                Update Escrow to {project.currency} {project.budget.toLocaleString()}
+                            </button>
+                        </div>
                     )}
                     {canReleasePayment && (
                         <button
@@ -703,6 +796,13 @@ function ProjectDetails({ params }: { params: { id: string } }) {
             {lockError && (
                 <p className="mt-4 rounded-md bg-red-50 px-3 py-2 text-sm text-red-600">
                     {lockError}
+                </p>
+            )}
+
+            {/* Relock error */}
+            {relockError && (
+                <p className="mt-4 rounded-md bg-red-50 px-3 py-2 text-sm text-red-600">
+                    {relockError}
                 </p>
             )}
 
@@ -889,6 +989,48 @@ function ProjectDetails({ params }: { params: { id: string } }) {
                         className="rounded-md bg-green-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-green-700 disabled:opacity-50"
                     >
                         {releasing ? "Releasing…" : "Release Payment"}
+                    </button>
+                </div>
+            </Modal>
+
+            {/* Update / Relock escrow confirmation modal */}
+            <Modal
+                open={showRelockModal}
+                onClose={() => setShowRelockModal(false)}
+                title="Update Escrow Amount?"
+            >
+                <p className="text-sm text-zinc-600">
+                    The agreement was amended to{" "}
+                    <strong>
+                        {project.currency} {project.budget.toLocaleString()}
+                    </strong>.
+                </p>
+                <p className="mt-2 text-sm text-zinc-600">
+                    Update locked escrow from{" "}
+                    <span className="line-through text-zinc-400">
+                        {payment?.currency} {payment?.amount.toLocaleString()}
+                    </span>{" "}
+                    to{" "}
+                    <strong>
+                        {project.currency} {project.budget.toLocaleString()}
+                    </strong>?
+                </p>
+                <p className="mt-2 text-xs text-zinc-500">
+                    This is a simulated escrow update for the hackathon demo.
+                </p>
+                <div className="mt-6 flex justify-end gap-3">
+                    <button
+                        onClick={() => setShowRelockModal(false)}
+                        className="rounded-md border border-zinc-300 px-4 py-2 text-sm font-medium text-zinc-700 transition-colors hover:bg-zinc-50"
+                    >
+                        Cancel
+                    </button>
+                    <button
+                        onClick={handleRelockPayment}
+                        disabled={relocking}
+                        className="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-blue-700 disabled:opacity-50"
+                    >
+                        {relocking ? "Updating…" : "Confirm Update"}
                     </button>
                 </div>
             </Modal>
