@@ -1,10 +1,19 @@
 "use client";
 
 /**
- * Freelancer Project Details + Accept & Submission Flow
+ * Freelancer Project Details + Submission Flow
  *
- * Shows full project info, accept button, escrow status,
- * and deliverable submission form / submitted state.
+ * Shows the locked agreement's terms, escrow status, and the deliverable
+ * submission form / submitted state.
+ *
+ * There is NO "Accept Project" button here any more. Adjudex is not a
+ * marketplace: a freelancer never claims a public job. Acceptance happens once,
+ * during the private negotiation at /transactions/[id], and by the time an
+ * execution project exists both parties have already agreed to the same terms.
+ *
+ * Privacy: the record is resolved through getProjectForUser(), so anyone who is
+ * not one of the two participants gets the same "not found" screen as an
+ * invalid id.
  */
 
 import { useEffect, useState, useCallback } from "react";
@@ -12,21 +21,20 @@ import Link from "next/link";
 import { useAuth } from "@/components/auth/AuthProvider";
 import { Card } from "@/components/ui/Card";
 import { StatusBadge } from "@/components/ui/StatusBadge";
-import { Modal } from "@/components/ui/Modal";
 import {
-    getProjectById,
+    getProjectForUser,
     getRequirementsByProjectId,
-    acceptProject,
 } from "@/services/projects";
 import { getPaymentByProjectId } from "@/services/payments";
 import {
     getSubmissionByProjectId,
     createSubmission,
 } from "@/services/submissions";
-import { getVerificationByProjectId } from "@/services/verification";
+import { getVerificationForUser } from "@/services/verification";
 import { VerificationReport } from "@/components/verification/VerificationReport";
 import { getApprovalByProjectId } from "@/services/approval";
 import { getAnyDisputeByProjectId } from "@/services/disputes";
+import { getTransactionByProjectId } from "@/services/transactions";
 import { getUserById } from "@/lib/auth";
 import type {
     Project,
@@ -77,6 +85,7 @@ function ProjectDetails({ projectId }: { projectId: string }) {
     const { user } = useAuth();
 
     const [project, setProject] = useState<Project | null>(null);
+    const [transactionId, setTransactionId] = useState<string | null>(null);
     const [requirements, setRequirements] = useState<Requirement[]>([]);
     const [clientUser, setClientUser] = useState<User | null>(null);
     const [payment, setPayment] = useState<Payment | null>(null);
@@ -84,10 +93,7 @@ function ProjectDetails({ projectId }: { projectId: string }) {
     const [verification, setVerification] = useState<AIVerificationResult | null>(null);
     const [approval, setApproval] = useState<Approval | null>(null);
     const [dispute, setDispute] = useState<Dispute | null>(null);
-    const [showConfirm, setShowConfirm] = useState(false);
-    const [accepting, setAccepting] = useState(false);
     const [error, setError] = useState("");
-    const [success, setSuccess] = useState("");
 
     // ── Submission form state ────────────────────────────────
     const [subTitle, setSubTitle] = useState("");
@@ -96,41 +102,32 @@ function ProjectDetails({ projectId }: { projectId: string }) {
     const [submitting, setSubmitting] = useState(false);
     const [submitSuccess, setSubmitSuccess] = useState(false);
 
-    // Load project data
+    // Load project data — every read is participant-scoped.
     const loadData = useCallback(() => {
-        const p = getProjectById(projectId);
-        if (p) {
-            setProject(p);
-            setRequirements(getRequirementsByProjectId(p.id));
-            setClientUser(getUserById(p.clientId));
-            setPayment(getPaymentByProjectId(p.id));
-            setSubmission(getSubmissionByProjectId(p.id));
-            setVerification(getVerificationByProjectId(p.id));
-            setApproval(getApprovalByProjectId(p.id));
-            setDispute(getAnyDisputeByProjectId(p.id));
+        if (!user) return;
+
+        const p = getProjectForUser(projectId, user.id);
+        if (!p) {
+            // Either it does not exist or this user is not a party to it.
+            setProject(null);
+            return;
         }
-    }, [projectId]);
+
+        setProject(p);
+        setTransactionId(getTransactionByProjectId(p.id)?.id ?? null);
+        // Returns the requirement set of the current agreed version.
+        setRequirements(getRequirementsByProjectId(p.id));
+        setClientUser(getUserById(p.clientId));
+        setPayment(getPaymentByProjectId(p.id));
+        setSubmission(getSubmissionByProjectId(p.id));
+        setVerification(getVerificationForUser(p.id, user.id));
+        setApproval(getApprovalByProjectId(p.id));
+        setDispute(getAnyDisputeByProjectId(p.id));
+    }, [projectId, user]);
 
     useEffect(() => {
         loadData();
     }, [loadData]);
-
-    // Accept handler
-    function handleAccept() {
-        if (!user || !project) return;
-        setAccepting(true);
-        setError("");
-        try {
-            acceptProject(project.id, user.id);
-            setSuccess("Project accepted! You are now assigned to this project.");
-            setShowConfirm(false);
-            loadData();
-        } catch (err) {
-            setError(err instanceof Error ? err.message : "Failed to accept project.");
-        } finally {
-            setAccepting(false);
-        }
-    }
 
     // Submission handler
     function handleSubmitDeliverable(e: React.FormEvent) {
@@ -174,16 +171,28 @@ function ProjectDetails({ projectId }: { projectId: string }) {
         }
     }
 
-    // ── Not found ──────────────────────────────────────────────
+    // ── Not found / not a participant ──────────────────────────
+
+    if (!user) {
+        return (
+            <main className="flex flex-1 items-center justify-center">
+                <p className="text-sm text-zinc-500">Loading…</p>
+            </main>
+        );
+    }
 
     if (!project) {
         return (
             <main className="flex flex-1 items-center justify-center">
                 <div className="text-center">
-                    <h2 className="text-lg font-semibold">Project not found</h2>
+                    <h2 className="text-lg font-semibold">Transaction not found</h2>
+                    <p className="mx-auto mt-2 max-w-sm text-sm text-zinc-500">
+                        Adjudex transactions are private. Either this id does not
+                        exist, or you are not one of its two participants.
+                    </p>
                     <Link
                         href="/freelancer/dashboard"
-                        className="mt-2 text-sm text-blue-600 hover:underline"
+                        className="mt-3 inline-block text-sm text-blue-600 hover:underline"
                     >
                         Back to dashboard
                     </Link>
@@ -193,11 +202,6 @@ function ProjectDetails({ projectId }: { projectId: string }) {
     }
 
     // Derived state
-    const canAccept =
-        project.status === "CREATED" &&
-        project.freelancerId === null &&
-        user?.role === "freelancer";
-
     const paymentLocked = payment?.status === "locked";
     const paymentReleased = payment?.status === "released";
     const hasSubmitted = submission !== null;
@@ -209,11 +213,6 @@ function ProjectDetails({ projectId }: { projectId: string }) {
     return (
         <main className="mx-auto flex w-full max-w-3xl flex-1 flex-col px-6 py-8">
             {/* Success banners */}
-            {success && (
-                <div className="mb-4 rounded-md bg-green-50 px-4 py-3 text-sm text-green-700">
-                    {success}
-                </div>
-            )}
             {submitSuccess && (
                 <div className="mb-4 rounded-md bg-green-50 px-4 py-3 text-sm text-green-700">
                     Deliverable submitted successfully! Awaiting AI verification.
@@ -232,6 +231,14 @@ function ProjectDetails({ projectId }: { projectId: string }) {
                     <h1 className="mt-2 text-2xl font-bold tracking-tight">
                         {project.title}
                     </h1>
+                    {transactionId && (
+                        <Link
+                            href={`/transactions/${transactionId}`}
+                            className="mt-1 inline-block text-xs text-blue-600 hover:underline"
+                        >
+                            Agreement, version history &amp; change proposals →
+                        </Link>
+                    )}
                 </div>
                 <StatusBadge status={project.status} />
             </div>
@@ -586,57 +593,12 @@ function ProjectDetails({ projectId }: { projectId: string }) {
                 {project.freelancerId && <span>Assigned to you</span>}
             </div>
 
-            {/* Accept button */}
-            {canAccept && (
-                <div className="mt-8">
-                    <button
-                        onClick={() => setShowConfirm(true)}
-                        className="rounded-md bg-blue-600 px-6 py-2.5 text-sm font-medium text-white transition-colors hover:bg-blue-700"
-                    >
-                        Accept Project
-                    </button>
-                </div>
-            )}
-
             {/* Error */}
             {error && (
                 <p className="mt-4 rounded-md bg-red-50 px-3 py-2 text-sm text-red-600">
                     {error}
                 </p>
             )}
-
-            {/* Confirmation modal */}
-            <Modal
-                open={showConfirm}
-                onClose={() => setShowConfirm(false)}
-                title="Accept this project?"
-            >
-                <p className="text-sm text-zinc-600">
-                    By accepting, you commit to working on{" "}
-                    <strong>{project.title}</strong> for{" "}
-                    <strong>
-                        {project.currency} {project.budget.toLocaleString()}
-                    </strong>{" "}
-                    with a deadline of{" "}
-                    <strong>{project.deadline.toLocaleDateString()}</strong>.
-                </p>
-
-                <div className="mt-6 flex justify-end gap-3">
-                    <button
-                        onClick={() => setShowConfirm(false)}
-                        className="rounded-md border border-zinc-300 px-4 py-2 text-sm font-medium text-zinc-700 transition-colors hover:bg-zinc-50"
-                    >
-                        Cancel
-                    </button>
-                    <button
-                        onClick={handleAccept}
-                        disabled={accepting}
-                        className="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-blue-700 disabled:opacity-50"
-                    >
-                        {accepting ? "Accepting…" : "Confirm & Accept"}
-                    </button>
-                </div>
-            </Modal>
         </main>
     );
 }

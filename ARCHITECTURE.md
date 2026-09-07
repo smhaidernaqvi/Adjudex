@@ -249,12 +249,20 @@ RequirementResult {
 
 ### AI Service Abstraction
 
-- **Environment variables** (set in `.env.local`, prefixed `NEXT_PUBLIC_` for client-side):
-  - `NEXT_PUBLIC_AI_API_KEY` — API key (required)
-  - `NEXT_PUBLIC_AI_API_URL` — API endpoint (optional, defaults to OpenAI)
-  - `NEXT_PUBLIC_AI_MODEL` — Model name (optional, defaults to `gpt-4o-mini`)
-- **No API key hardcoded** — `isAIConfigured()` checks env var availability
-- **Structured JSON output** — system prompt enforces JSON response format
+- **Server-only integration** — all outbound AI calls live in the API route
+  `src/app/api/ai/route.ts`. The browser never sees the API key.
+- **Environment variable** (set in `.env.local`, server-side only):
+  - `GEMINI_API_KEY` — Google Gemini API key (required)
+- **Provider:** Google Gemini OpenAI-compatible endpoint
+  `https://generativelanguage.googleapis.com/v1beta/openai/chat/completions`,
+  model `gemini-2.5-flash`
+- **Client layer** — `src/lib/ai/index.ts` exposes typed wrappers
+  (`verifyDeliverableWithAI()`, `refineRequirementsWithAI()`) that POST to `/api/ai`
+  with `task: "verify" | "refine"`
+- **Route protection** — middleware requires a valid `auth_token` cookie for `/api/ai/*`
+  and answers `401` JSON when missing
+- **Structured JSON output** — system prompt enforces JSON response format;
+  parser tolerates stray markdown fences
 - **Response validation** — parsed and validated before storage; malformed responses throw
 
 ### Verification Flow
@@ -278,7 +286,8 @@ Client opens SUBMITTED project
 
 ### Error Handling
 
-- Missing API key → amber info box: "Add NEXT_PUBLIC_AI_API_KEY to .env.local"
+- Missing API key → server returns `503` with "AI is not configured. Set GEMINI_API_KEY…";
+  the UI shows it as a clean error and manual entry/editing still works
 - API request failure → error banner + failed verification record stored
 - Malformed AI response → error with specific field name
 - Duplicate verification → rejected with error message
